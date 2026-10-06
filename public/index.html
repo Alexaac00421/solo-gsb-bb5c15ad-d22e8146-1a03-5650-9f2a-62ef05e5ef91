@@ -27,6 +27,7 @@
   <nav class="tabs">
     <button class="tab active" data-tab="network">供电网络</button>
     <button class="tab" data-tab="permits">检修许可</button>
+    <button class="tab" data-tab="orders">临时操作单</button>
     <button class="tab" data-tab="admin">拓扑管理<span class="admin-dot">管理员</span></button>
     <button class="tab" data-tab="audit">变更记录</button>
   </nav>
@@ -68,9 +69,46 @@
       </div>
     </section>
 
-    <!-- 拓扑管理 -->
-    <section id="tab-admin" class="tabpane">
+    <!-- 临时操作单 -->
+    <section id="tab-orders" class="tabpane">
       <div class="layout two-col">
+        <div class="panel">
+          <h3>编排操作单（按序执行）</h3>
+          <p class="hint">检修前依次编排：分闸 → 挂牌 …；末步可选“申请许可”。
+            预演只在内存中展示各步结果与目标设备隔离状态，不改变真实网络、许可、修订号与审计；
+            确认时按原顺序原子执行，任一步失败整单不落库（后续步骤不能补救前一步违规）。</p>
+          <div class="form-row">
+            <select id="orderAction">
+              <option value="open">分闸 open</option>
+              <option value="tag">挂牌 tag</option>
+              <option value="untag">解牌 untag</option>
+              <option value="close">合闸 close</option>
+              <option value="permit">申请许可 permit（仅末步）</option>
+            </select>
+            <select id="orderTarget"></select>
+            <button id="orderAddBtn" class="btn btn-primary">加入步骤</button>
+          </div>
+          <table class="grid" id="orderGrid">
+            <thead><tr><th>#</th><th>动作</th><th>目标</th><th>操作</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div class="form-row" style="margin-top:12px">
+            <button id="orderPreviewBtn" class="btn btn-warn">预演</button>
+            <button id="orderConfirmBtn" class="btn btn-primary">确认执行</button>
+            <button id="orderClearBtn" class="btn">清空</button>
+          </div>
+        </div>
+        <div class="panel">
+          <h3>预演 / 确认结果</h3>
+          <div id="orderResult" class="order-result">
+            <p class="hint">先在左侧编排步骤，点击“预演”查看各步结果。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 拓扑管理 -->
+    <section id="tab-admin" class="tabpane">      <div class="layout two-col">
         <div class="panel">
           <h3>新增节点</h3>
           <div class="form-row">

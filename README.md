@@ -10,7 +10,8 @@
 ### 角色
 - **管理员（admin）**：维护供电网络 —— 新增 / 删除 / 重命名电源、开关、设备，
   启用 / 停用电源，架设或拆除有向供电关系（边）。
-- **操作员（operator）**：开关分闸、合闸、挂牌、解牌；为设备申请 / 结束检修许可。
+- **操作员（operator）**：开关分闸、合闸、挂牌、解牌；为设备申请 / 结束检修许可；
+  编排并执行**临时操作单**（分闸 → 挂牌 → 申请许可的有序成套操作，支持预演）。
 
 ### 开关状态机
 1. 合闸位置的开关必须先 **分闸（open）** 才能 **挂牌（tag）**；
@@ -63,6 +64,30 @@
 > 200 条 / 64 节点上限影响——即使供电路径数量极多或极长，只要存在一条
 > 未切断通路，操作就会被整体拒绝并回滚；拒绝体中的 `truncated` 仅说明
 > 附带展示的路径列表被限量截断，不代表隔离结论不确定。
+
+### 临时操作单（编排 — 预演 — 确认）
+检修前常需依次“分闸、挂牌并申请许可”。操作员可在浏览器“临时操作单”页（或调用
+HTTP API）临时编排一张操作单：
+
+- 步骤按序填写：开关编号 + 动作（`open` 分闸、`tag` 挂牌、`untag` 解牌、
+  `close` 合闸），**末步**可填写设备编号执行一次 `permit` 申请许可（许可步只能是
+  最后一步；一张单子至多一个许可步）。
+- **预演**（`POST /api/orders/preview`）纯只读：展示每一步的动作、前后开关状态、
+  成功 / 失败 / 未执行、失败原因；若末步申请许可，同时展示目标设备**当前**隔离
+  状态与“按本单前面步骤执行后”的隔离结论。预演**不改变真实网络、有效许可、
+  修订号或审计**，响应携带所依据的当前 `revision`。
+- **确认**（`POST /api/orders/confirm`）在 `IMMEDIATE` 事务、修订号校验通过后按
+  **原顺序原子执行**：每一步都遵守现有开关状态机与有效许可隔离保护；
+  **不允许用后续步骤补救前一步违规**——任一步失败即在该步中止，响应返回
+  **步骤序号 `step`**、动作名与原因（错误码沿用 `SWITCH_TAGGED`、
+  `SWITCH_NOT_OPEN`、`INVALID_STATE`、`ISOLATION_VIOLATION`、
+  `PERMIT_NOT_ISOLATED` 等），隔离失败附**实际带电路径**（`livePaths` /
+  `violations[].livePaths`）与截断标记，整单回滚、**不落库**（修订号、审计均不变）。
+- 确认沿用现有 `actor` / `role`（仅 `operator`）/ `revision` 及 `STALE_REVISION`
+  约定：预演后若版本被他人改变，确认返回 `409` 与**当前完整状态**，核对后重试；
+  成功时整单**只递增一次修订号**，审计只写**一条** `order.confirm` 记录，
+  `detail.steps` 为有序执行清单，`state_before` / `state_after` 为整单前后完整快照。
+- 操作单本身是浏览器 / 请求里的临时编排，**不建表、不落库**。
 
 ### 多人并发（乐观锁）
 - 每次成功变更都会让全局 **修订号 revision + 1**（界面右上角实时显示）。
@@ -140,13 +165,17 @@ cp .env.example .env
    - 电源：管理员可启用 / 停用；
    - 开关：操作员可分闸、合闸、挂牌、解牌（图中红色虚边为被挂牌切断的线路）；
    - 设备：操作员可申请许可，或“查看供电路径”（未切断路径橙色高亮）。
-3. **检修许可** 页：选择设备申请许可；申请失败时弹窗列出至少一条未切断路径；
+3. **临时操作单** 页（操作员）：选择动作与目标逐行加入步骤（可上下移动 / 删除）；
+   点“预演”可反复演练，右侧展示各步前后状态、成功/失败/未执行与目标设备当前及
+   按单推演后的隔离状态，真实状态不变；预演通过后点“确认执行”，整单原子落库、
+   修订号 +1；若预演后他人已提交，确认会收到 `409 STALE_REVISION` 并自动刷新。
+4. **检修许可** 页：选择设备申请许可；申请失败时弹窗列出至少一条未切断路径；
    路径数量 / 长度超过诊断上限时，弹窗与许可卡片会用黄色提示标记“仅展示部分
    路径”，但拒绝结论基于完整可达性分析，不受上限影响。有效许可卡片实时显示
    隔离是否满足，可随时结束许可。
-4. **拓扑管理** 页（管理员）：维护节点和有向供电关系。
+5. **拓扑管理** 页（管理员）：维护节点和有向供电关系。
    规则：电源只能作起点、设备只能作终点、不允许自环和重复接线。
-5. **变更记录** 页：查看所有成功变更的时间、操作者、动作、前后修订号，
+6. **变更记录** 页：查看所有成功变更的时间、操作者、动作、前后修订号，
    可展开查看前后完整状态快照。
 6. 页面每 10 秒轮询一次修订号；他人提交后会自动刷新。若你的提交过期，
    会收到明确提示并刷新到最新状态。
@@ -183,6 +212,8 @@ cp .env.example .env
 | POST | `/api/switches/:id/untag` | operator | 解牌（破坏有效许可隔离时拒绝） |
 | POST | `/api/permits` | operator | 申请许可 `{device_id}` |
 | POST | `/api/permits/:id/end` | operator | 结束许可 |
+| POST | `/api/orders/preview` | operator | 临时操作单**预演**（只读，不校验/改变修订号）`{steps:[...]}` |
+| POST | `/api/orders/confirm` | operator | 临时操作单**确认执行**（原子，revision +1）`{steps:[...]}` |
 
 错误约定：`400` 参数错误 / `403` 角色不允许 / `404` 不存在 /
 `409 STALE_REVISION` 修订号过期（响应含 `current` 当前状态）/
@@ -201,6 +232,58 @@ cp .env.example .env
 同样携带 `truncated`。接口路径、请求字段、错误码、角色校验、revision
 冲突处理、事务回滚与审计快照约定均保持不变。
 
+#### 临时操作单 API 示例
+
+步骤对象：开关步 `{"action":"open|tag|untag|close","node_id":3}`；
+许可步（仅末步）`{"action":"permit","device_id":6}`。
+
+```bash
+# 1) 预演: 分闸 K1→挂牌 K1→分闸 K2→挂牌 K2→为 1#循环水泵 申请许可
+curl -s -X POST http://localhost:3000/api/orders/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "actor": "张三", "role": "operator", "revision": 1,
+    "steps": [
+      {"action":"open","node_id":3}, {"action":"tag","node_id":3},
+      {"action":"open","node_id":4}, {"action":"tag","node_id":4},
+      {"action":"permit","device_id":6}
+    ]
+  }'
+# -> { ok:true, kind:"order.preview", revision:1, success:true, failedStep:null,
+#      steps:[ {step:1,action:"open",ok:true,before:{open_pos:false,tagged:false},
+#               after:{open_pos:true,tagged:false},message:"分闸完成（分闸）"},
+#              ...,
+#              {step:5,action:"permit",ok:true,isolation:{isolated:true,...}} ],
+#      permitIsolation:{ device_id:6, device_name:"1#循环水泵", isolated:false,
+#                        livePaths:[...] } }   # 目标设备“当前”隔离状态(执行前)
+# 预演不写任何数据; failedStep 非空时该步含 error, 其后各步 skipped:true。
+
+# 2) 确认执行: 携带所见 revision; 成功整单只 +1 并写一条 order.confirm 审计
+curl -s -X POST http://localhost:3000/api/orders/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "actor": "张三", "role": "operator", "revision": 1,
+    "steps": [
+      {"action":"open","node_id":3}, {"action":"tag","node_id":3},
+      {"action":"open","node_id":4}, {"action":"tag","node_id":4},
+      {"action":"permit","device_id":6}
+    ]
+  }'
+# -> 200 { ok:true, action:"order.confirm",
+#         steps:[{step:1,action:"open",node_id:3}, ...,
+#                {step:5,action:"permit",device_id:6,permit_id:1}],
+#         permit_id:1, revision:2, snapshot:{...当前完整状态...} }
+#
+# 任一步失败 -> 422 { ok:false, step:3, step_name:"挂牌",
+#                     error:{code:"SWITCH_NOT_OPEN",message:"第 3 步执行失败: ..."},
+#                     step_results:[...各步结果...],
+#                     livePaths|violations:[...实际带电路径...], truncated:{...} }
+# 整单回滚不落库; 修订号过期 -> 409 STALE_REVISION + current(当前完整状态)。
+```
+
+预演请求也需带 `actor` 与 `role:operator`（仅做身份展示与鉴权），但 `revision`
+不参与校验——预演永远基于当前状态推演。
+
 ## 目录结构
 
 ```
@@ -212,6 +295,7 @@ cp .env.example .env
 ├── src/
 │   ├── db.js               # SQLite 连接、表结构、演示数据
 │   ├── graph.js            # 完整可达性隔离判定(无上限) + 限量诊断路径枚举
+│   ├── orders.js           # 临时操作单: 结构校验 + 纯内存预演 + 按序原子提交
 │   └── init-db.js          # 建库脚本(npm run init-db)
 ├── public/                 # 浏览器界面(原生 JS + SVG)
 │   ├── index.html
@@ -219,6 +303,7 @@ cp .env.example .env
 │   └── styles.css
 └── test/
     ├── smoke.js            # 端到端业务规则冒烟测试(HTTP)
+    ├── orders.e2e.js       # 临时操作单预演/确认/原子回滚/STALE_REVISION 的 HTTP 回归
     ├── graph.test.js       # 隔离判定单元测试(枚举触顶/超长/环路)
     └── truncation.e2e.js   # 200 条挂牌支路挤掉带电路径的 HTTP 回归(手动)
 ```
@@ -232,6 +317,9 @@ npm run test:graph
 # 端到端冒烟(终端1 起服务, 终端2 跑测试; 使用独立 DB 避免污染演示库)
 LOTO_DB=/tmp/loto-test.db PORT=3100 node server.js
 node test/smoke.js
+
+# 临时操作单回归(预演只读/确认原子/逐步失败不可补救/整单回滚/单次修订号/409)
+BASE=http://127.0.0.1:3100 node test/orders.e2e.js
 
 # 枚举触顶回归(同样打到 PORT=3100 的服务; 结束会清理临时拓扑)
 node test/truncation.e2e.js

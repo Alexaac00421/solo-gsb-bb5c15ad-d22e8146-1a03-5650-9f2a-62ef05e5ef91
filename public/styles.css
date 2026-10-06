@@ -153,6 +153,24 @@ details.snapshot pre {
   font-size: 11px; overflow: auto; max-height: 300px;
 }
 
+/* 临时操作单 */
+.order-head {
+  border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; font-weight: 600;
+}
+.order-head.ok { background: #ecfdf5; border: 1px solid #6ee7b7; color: #065f46; }
+.order-head.bad { background: #fff1f2; border: 1px solid #fda4af; color: #991b1b; }
+.order-permit {
+  border: 1px dashed #c4b5fd; background: #f5f3ff; border-radius: 8px;
+  padding: 6px 10px; margin-bottom: 10px; font-size: 13px; color: #5b21b6;
+}
+.order-step {
+  border-left: 4px solid #cbd5e1; background: #f8fafc; border-radius: 6px;
+  padding: 6px 10px; margin-bottom: 6px; font-size: 13px;
+}
+.order-step.ok { border-left-color: #059669; background: #f0fdf4; }
+.order-step.bad { border-left-color: #dc2626; background: #fff1f2; }
+.order-step.skipped { border-left-color: #9ca3af; background: #f3f4f6; color: #6b7280; }
+
 /* Toast */
 .toast {
   position: fixed; right: 18px; bottom: 18px; max-width: 460px; z-index: 50;

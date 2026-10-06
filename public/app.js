@@ -8,7 +8,12 @@ const state = {
   selectedNodeId: null,  // 图上选中的节点
   highlightPaths: [],    // 需要高亮的路径(节点id数组的数组)
   role: 'operator',
-  actor: ''
+  actor: '',
+  order: {
+    steps: [],           // 浏览器临时编排, 不落库: {action,node_id|device_id}
+    result: null,        // 最近一次预演/确认结果
+    kind: null           // 'preview' | 'confirm'
+  }
 };
 
 const ACTION_LABELS = {
@@ -16,7 +21,11 @@ const ACTION_LABELS = {
   'edge.create': '新增供电关系', 'edge.delete': '删除供电关系',
   'switch.open': '开关分闸', 'switch.close': '开关合闸',
   'switch.tag': '开关挂牌', 'switch.untag': '开关解牌',
-  'permit.apply': '申请检修许可', 'permit.end': '结束检修许可'
+  'permit.apply': '申请检修许可', 'permit.end': '结束检修许可',
+  'order.confirm': '临时操作单执行'
+};
+const ORDER_ACTION_LABEL = {
+  open: '分闸', close: '合闸', tag: '挂牌', untag: '解牌', permit: '申请许可'
 };
 const KIND_LABELS = { source: '电源', switch: '开关', device: '设备' };
 
@@ -57,6 +66,8 @@ async function mutate(method, url, payload) {
     toast(`⚠ ${data.error.message}\n界面已刷新为他人提交后的最新状态，请核对后重新操作。`, 'error');
     return null;
   }
+  // 操作单确认失败: 保留步骤明细供结果区展示
+  lastOrderError = data.step !== undefined ? data : null;
   handleBusinessError(data);
   return null;
 }
@@ -405,6 +416,178 @@ function renderPermits() {
 window.endPermit = (id) => mutate('POST', `/api/permits/${id}/end`, {});
 
 // ---------------------------------------------------------------------------
+// 临时操作单: 编排 / 预演(只读) / 确认(原子执行)
+// ---------------------------------------------------------------------------
+function orderTargetName(snap, step) {
+  const id = step.action === 'permit' ? step.device_id : step.node_id;
+  const n = snap.nodes.find((x) => x.id === id);
+  return n ? n.name : `#${id}（已不存在）`;
+}
+
+// 目标下拉随动作切换: 开关动作选开关, 申请许可选设备
+function refreshOrderTargets() {
+  const snap = state.snapshot;
+  if (!snap) return;
+  const action = $('orderAction').value;
+  const list = action === 'permit'
+    ? snap.nodes.filter((n) => n.kind === 'device')
+    : snap.nodes.filter((n) => n.kind === 'switch');
+  $('orderTarget').innerHTML = list
+    .map((n) => `<option value="${n.id}">${escapeHtml(n.name)}${n.kind === 'switch'
+      ? `（${n.open_pos ? '分闸' : '合闸'}${n.tagged ? '·🔒挂牌' : ''}）` : ''}</option>`)
+    .join('');
+}
+
+function renderOrderEditor() {
+  const snap = state.snapshot;
+  if (!snap) return;
+  refreshOrderTargets();
+  const tbody = $('orderGrid').querySelector('tbody');
+  if (!state.order.steps.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="hint">还没有步骤。</td></tr>';
+    return;
+  }
+  tbody.innerHTML = state.order.steps.map((s, i) => `
+    <tr>
+      <td>${i + 1}</td>
+      <td>${ORDER_ACTION_LABEL[s.action]} <span class="hint">${s.action}</span></td>
+      <td>${escapeHtml(orderTargetName(snap, s))}</td>
+      <td>
+        <button class="btn btn-sm" data-order="up" data-idx="${i}" ${i === 0 ? 'disabled' : ''}>↑</button>
+        <button class="btn btn-sm" data-order="down" data-idx="${i}" ${i === state.order.steps.length - 1 ? 'disabled' : ''}>↓</button>
+        <button class="btn btn-sm btn-danger" data-order="del" data-idx="${i}">删除</button>
+      </td>
+    </tr>`).join('');
+}
+
+function stateBadge(st) {
+  if (!st) return '';
+  return `<span class="hint">[${st.tagged ? '挂牌' : st.open_pos ? '分闸' : '合闸'}]</span>`;
+}
+
+function renderOrderResult() {
+  const box = $('orderResult');
+  const o = state.order;
+  if (!o.result) {
+    box.innerHTML = '<p class="hint">先在左侧编排步骤，点击“预演”查看各步结果。</p>';
+    return;
+  }
+
+  const headKind = o.kind === 'confirm' ? '确认执行' : '预演';
+  const r = o.result;
+  const head = r.success
+    ? `<div class="order-head ok">✔ ${headKind}通过：全部 ${r.steps.filter((s) => !s.skipped).length} 步均可执行${
+      o.kind === 'confirm' ? `，已原子落库（新修订号 ${r.revision}）` : '（预演不改变真实状态）'}</div>`
+    : `<div class="order-head bad">✖ ${headKind}在第 ${r.failedStep} 步失败：${escapeHtml(r.error ? r.error.message : '')}
+        <div class="hint">整单${o.kind === 'confirm' ? '已回滚，未写入任何数据' : '预演中止'}；后续步骤标记为“未执行”，不能补救前一步违规。</div></div>`;
+
+  const iso = (x) => x ? `<div class="hint">隔离：${x.isolated ? '✔ 已隔离'
+    : `✖ 未隔离，${x.livePaths.length} 条未切断路径`}${x.blockedPathCount ? `；挂牌切断路径 ${x.blockedPathCount} 条` : ''}</div>` : '';
+
+  // 末步许可结论以“按单推演后的该步结果”为准; 另附目标设备当前(执行前)隔离状态
+  const permitSim = r.steps.find((s) => s.action === 'permit');
+  const permitBanner = r.permitIsolation ? (() => {
+    const cur = r.permitIsolation;
+    const curTxt = cur.isolated ? '当前已隔离' : `当前未隔离（${cur.livePaths.length} 条未切断路径）`;
+    let afterTxt = '';
+    if (permitSim) {
+      afterTxt = permitSim.ok
+        ? '；按本单前面步骤执行后 ✔ 将满足隔离，许可可生效'
+        : '；按本单前面步骤执行后仍 ✖ 未隔离，许可将被拒绝';
+    }
+    return `<div class="order-permit">末步申请许可目标「${escapeHtml(cur.device_name)}」：${curTxt}${afterTxt}</div>`;
+  })() : '';
+
+  box.innerHTML = head + permitBanner + r.steps.map((s) => {
+    const cls = s.skipped ? 'skipped' : s.ok ? 'ok' : 'bad';
+    const target = s.action === 'permit'
+      ? `设备「${escapeHtml(s.device_name || '')}」`
+      : `开关「${escapeHtml(s.name || '')}」 #${s.node_id}`;
+    let pathsHtml = '';
+    const paths = [];
+    if (s.violations) s.violations.forEach((v) => paths.push(...v.livePaths));
+    if (s.isolation && !s.isolation.isolated) paths.push(...s.isolation.livePaths);
+    if (paths.length) {
+      pathsHtml = paths.slice(0, 5).map((p) =>
+        `<div class="path-line">带电：${p.nodes.map((n) => n.tagged ? `🔒${n.name}` : n.name).join(' → ')}</div>`).join('')
+        + (paths.length > 5 ? `<div class="hint">…另有 ${paths.length - 5} 条。</div>` : '');
+    }
+    return `<div class="order-step ${cls}">
+      <b>第 ${s.step} 步</b> · ${ORDER_ACTION_LABEL[s.action]} · ${target}
+      ${s.before ? `${stateBadge(s.before)} → ${stateBadge(s.after)}` : ''}
+      <div>${s.skipped ? '⏭ ' : s.ok ? '✔ ' : '✖ '}${escapeHtml(s.message || (s.error ? s.error.message : ''))}</div>
+      ${iso(s.isolation)}${pathsHtml}
+    </div>`;
+  }).join('');
+
+  // 失败时在网络图上高亮实际带电路径
+  if (!r.success) {
+    const paths = [];
+    r.steps.forEach((s) => {
+      if (s.violations) s.violations.forEach((v) => paths.push(...v.livePaths));
+      if (s.isolation && !s.isolation.isolated) paths.push(...s.isolation.livePaths);
+    });
+    if (paths.length) {
+      state.highlightPaths = paths.map((p) => p.nodes.map((n) => n.id));
+      renderGraph();
+    }
+  }
+}
+
+async function orderPreview() {
+  if (!state.order.steps.length) return toast('请先编排至少一个步骤', 'error');
+  const r = await fetch('/api/orders/preview', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      actor: state.actor, role: state.role,
+      revision: state.snapshot ? state.snapshot.revision : 1,
+      steps: state.order.steps
+    })
+  });
+  const data = await r.json().catch(() => ({}));
+  if (r.ok) {
+    state.order.result = data;
+    state.order.kind = 'preview';
+    renderOrderResult();
+    toast(data.success
+      ? '预演通过（真实网络、许可、修订号与审计均未改变）'
+      : `预演显示第 ${data.failedStep} 步将被拒绝`, data.success ? 'success' : 'error');
+    return;
+  }
+  // 结构/身份类错误直接提示
+  toast(`✖ ${data.error ? data.error.message : '预演请求失败'}`, 'error');
+}
+
+async function orderConfirm() {
+  if (!state.order.steps.length) return toast('请先编排至少一个步骤', 'error');
+  if (!confirm(`确认按当前顺序原子执行这 ${state.order.steps.length} 个步骤？\n任一步失败整单回滚、不落库。`)) return;
+  const data = await mutate('POST', '/api/orders/confirm', { steps: state.order.steps });
+  if (data) {
+    state.order.result = {
+      success: true, failedStep: null, error: null,
+      revision: data.revision, steps: state.order.result ? state.order.result.steps : [],
+      permitIsolation: state.order.result ? state.order.result.permitIsolation : null
+    };
+    state.order.kind = 'confirm';
+    renderOrderResult();
+  } else if (lastOrderError) {
+    state.order.result = {
+      success: false,
+      failedStep: lastOrderError.step,
+      error: lastOrderError.error,
+      steps: lastOrderError.step_results,
+      permitIsolation: state.order.result ? state.order.result.permitIsolation : null
+    };
+    state.order.kind = 'confirm';
+    renderOrderResult();
+  }
+}
+
+// 供 orderConfirm 读取最近一次确认失败的步骤明细
+let lastOrderError = null;
+
+// ---------------------------------------------------------------------------
 // 渲染: 管理页
 // ---------------------------------------------------------------------------
 function renderAdmin() {
@@ -482,6 +665,7 @@ function render() {
   renderIsolationList();
   renderPermits();
   renderAdmin();
+  renderOrderEditor();
 }
 
 function toast(message, kind) {
@@ -532,7 +716,8 @@ $('role').addEventListener('change', () => {
 document.addEventListener('click', (ev) => {
   const actionable = ev.target.closest('button');
   if (!actionable) return;
-  const mutating = actionable.id && ['addNodeBtn', 'addEdgeBtn', 'applyBtn'].includes(actionable.id)
+  const mutating = actionable.id && ['addNodeBtn', 'addEdgeBtn', 'applyBtn',
+      'orderAddBtn', 'orderPreviewBtn', 'orderConfirmBtn'].includes(actionable.id)
     || actionable.hasAttribute('data-admin')
     || actionable.closest('#nodeActions')
     || actionable.getAttribute('onclick');
@@ -556,6 +741,54 @@ $('addEdgeBtn').addEventListener('click', () => {
 });
 $('applyBtn').addEventListener('click', () => {
   mutate('POST', '/api/permits', { device_id: parseInt($('applyDevice').value, 10) });
+});
+
+// 临时操作单事件
+$('orderAction').addEventListener('change', refreshOrderTargets);
+$('orderAddBtn').addEventListener('click', () => {
+  const action = $('orderAction').value;
+  const target = parseInt($('orderTarget').value, 10);
+  if (!Number.isInteger(target)) return toast('没有可选目标', 'error');
+  const steps = state.order.steps;
+  if (action === 'permit' && steps.length && steps[steps.length - 1].action === 'permit') {
+    return toast('末步已是申请许可；一张操作单至多一个申请许可步', 'error');
+  }
+  if (action !== 'permit' && steps.some((s) => s.action === 'permit')) {
+    return toast('申请许可只能是末步，请先删除许可步再追加开关动作', 'error');
+  }
+  steps.push(action === 'permit'
+    ? { action: 'permit', device_id: target }
+    : { action, node_id: target });
+  state.order.result = null;
+  renderOrderEditor();
+  renderOrderResult();
+});
+$('orderGrid').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('[data-order]');
+  if (!btn) return;
+  const idx = parseInt(btn.dataset.idx, 10);
+  const steps = state.order.steps;
+  const op = btn.dataset.order;
+  if (op === 'del') steps.splice(idx, 1);
+  if (op === 'up' && idx > 0) [steps[idx - 1], steps[idx]] = [steps[idx], steps[idx - 1]];
+  if (op === 'down' && idx < steps.length - 1) [steps[idx + 1], steps[idx]] = [steps[idx], steps[idx + 1]];
+  // 移动后若许可不在末位则纠正(后端同样强制)
+  const permitIdx = steps.findIndex((s) => s.action === 'permit');
+  if (permitIdx >= 0 && permitIdx !== steps.length - 1) {
+    const [p] = steps.splice(permitIdx, 1);
+    steps.push(p);
+  }
+  state.order.result = null;
+  renderOrderEditor();
+  renderOrderResult();
+});
+$('orderPreviewBtn').addEventListener('click', orderPreview);
+$('orderConfirmBtn').addEventListener('click', orderConfirm);
+$('orderClearBtn').addEventListener('click', () => {
+  state.order.steps = [];
+  state.order.result = null;
+  renderOrderEditor();
+  renderOrderResult();
 });
 document.addEventListener('click', (ev) => {
   const btn = ev.target.closest('[data-admin]');

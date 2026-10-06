@@ -8,6 +8,13 @@ const {
   validateActivePermits,
   serializePath
 } = require('./src/graph');
+const {
+  OrderError,
+  ACTION_LABEL,
+  normalizeSteps,
+  simulateOrder,
+  commitOrder
+} = require('./src/orders');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.LOTO_DB || path.join(__dirname, 'data', 'loto.db');
@@ -462,15 +469,108 @@ app.post('/api/permits/:id/end', wrap((req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
+// 临时操作单 —— 仅操作员; 预演只读, 确认原子执行
+// ---------------------------------------------------------------------------
+
+// 预演/确认共用的操作者身份校验(预演不落库, 但沿用同一 actor/role 约定)
+function requireOperator(body) {
+  const actor = typeof body.actor === 'string' ? body.actor.trim() : '';
+  const role = body.role;
+  if (!actor) throw new ApiError(400, 'ACTOR_REQUIRED', '必须填写操作者姓名');
+  if (role !== 'admin' && role !== 'operator') {
+    throw new ApiError(400, 'ROLE_REQUIRED', '角色必须是 admin 或 operator');
+  }
+  if (role !== 'operator') throw new ApiError(403, 'FORBIDDEN', '临时操作单仅允许 operator 执行');
+  return actor.trim();
+}
+
+// 预演: 不校验/递增修订号, 不写任何库; 永远基于当前状态推演并返回当前修订号。
+app.post('/api/orders/preview', wrap((req, res) => {
+  requireOperator(req.body || {});
+  const actor = req.body.actor.trim();
+  const graph = loadGraph();
+  const steps = normalizeSteps(graph, req.body?.steps);
+  const simulation = simulateOrder(graph, activePermits(), steps, actor);
+  const permitStep = steps.find((s) => s.action === 'permit');
+  res.json({
+    ok: true,
+    kind: 'order.preview',
+    revision: currentRevision(), // 预演所依据的修订号
+    success: simulation.success,
+    failedStep: simulation.failedStep,
+    error: simulation.error,
+    steps: simulation.steps,
+    // 若末步申请许可, 附目标设备当前隔离状态(纯展示, 不改变任何数据)
+    permitIsolation: permitStep
+      ? (() => {
+          const r = evaluateIsolation(graph, permitStep.device_id);
+          return {
+            device_id: permitStep.device_id,
+            device_name: permitStep.device_name,
+            isolated: r.isolated,
+            livePaths: r.livePaths.map((p) => serializePath(graph, p)),
+            blockedPathCount: r.blockedPaths.length,
+            truncated: r.truncated
+          };
+        })()
+      : null
+  });
+}));
+
+// 确认: STALE_REVISION / 角色 / 事务回滚 / 单次修订号递增 / 整单审计, 均沿用既有约定。
+app.post('/api/orders/confirm', wrap((req, res) => {
+  runMutation(res, {
+    body: req.body, action: 'order.confirm', requireRole: 'operator',
+    skipPermitCheck: true, // 整单隔离保护在逐步推演中逐次完成, 等价且更精确
+    mutate: ({ detail, result }) => {
+      const graph = loadGraph();
+      const steps = normalizeSteps(graph, req.body?.steps);
+      const actor = req.body.actor.trim();
+
+      const simulation = simulateOrder(graph, activePermits(), steps, actor);
+      if (!simulation.success) {
+        const f = simulation.steps[simulation.failedStep - 1];
+        // 隔离失败(violations)或末步许可未隔离(livePaths)都在此携带实际带电路径
+        throw new OrderError(422, f.error.code,
+          `第 ${simulation.failedStep} 步执行失败: ${f.error.message}`,
+          {
+            step: simulation.failedStep,
+            step_name: ACTION_LABEL[f.action],
+            step_results: simulation.steps,
+            ...(f.violations ? { violations: f.violations } : {}),
+            ...(f.isolation ? {
+              livePaths: f.isolation.livePaths,
+              truncated: f.isolation.truncated,
+              device_id: f.device_id,
+              device_name: f.device_name
+            } : {})
+          });
+      }
+
+      const committed = commitOrder(db, steps, actor);
+      detail.steps = committed;
+      result.steps = committed;
+      const permit = committed.find((c) => c.action === 'permit');
+      if (permit) result.permit_id = permit.permit_id;
+    }
+  });
+}));
+
+// ---------------------------------------------------------------------------
 // 错误处理
 // ---------------------------------------------------------------------------
 app.use((err, req, res, next) => {
-  if (err instanceof ApiError) {
+  if (err instanceof ApiError || err instanceof OrderError) {
     const body = { ok: false, error: { code: err.code, message: err.message } };
     if (err.current) body.current = err.current;
     if (err.violations) body.violations = err.violations;
     if (err.livePaths) body.livePaths = err.livePaths;
     if (err.truncated) body.truncated = err.truncated;
+    if (err.step !== undefined) {
+      body.step = err.step;
+      body.step_name = err.step_name;
+      body.step_results = err.step_results;
+    }
     if (err.device_id !== undefined) {
       body.device_id = err.device_id;
       body.device_name = err.device_name;
