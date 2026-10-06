@@ -70,6 +70,27 @@
 - 提交时若库中修订号已不同，返回 `409 STALE_REVISION` 与 **当前完整状态**，
   前端自动刷新为最新状态，要求核对后重试；过期提交不会落库。
 
+### 临时操作单（编排 → 预演 → 确认）
+检修前常需“依次分闸、挂牌，再申请许可”。操作员可在 **操作单** 页（或调用
+API）把整串动作编成一张临时操作单：
+
+- **编排**：按序填写开关编号与动作（`open` 分闸 / `tag` 挂牌 / `untag` 解牌 /
+  `close` 合闸）；**末步**可填写设备编号申请一个许可（`permit`，仅允许在末步、
+  至多一个）。操作单只存在于浏览器/请求体中，确认前不落库。
+- **预演** `POST /api/orders/preview`：在 SAVEPOINT 内完整执行后强制回滚，
+  **不改变真实网络、许可、修订号或审计**；响应逐步展示执行结果，首个失败步
+  即停止并给出原因（隔离类失败附实际带电路径）；若末步为申请许可，额外展示
+  目标设备的隔离状态（含被挂牌切断路径）。
+- **确认** `POST /api/orders/commit`：单事务内 **按原顺序原子执行**。每一步都
+  遵守现有开关状态机，且每个开关步执行后立即复查有效许可隔离保护——
+  **不允许用后续步骤补救前一步违规**（如“解牌→重新挂牌”序列在第 1 步即被拒）。
+  任一步失败整单回滚不落库，返回 `ORDER_STEP_FAILED`、步骤序号 `step`、
+  原始原因 `cause`，隔离失败附实际带电路径（`livePaths` / `violations`）。
+- 确认沿用现有 `actor` / `role` / `revision` 与 `STALE_REVISION` 约定：预演后
+  若版本已变化，确认返回 `409` 与 **当前完整状态**；预演本身基于过期修订号
+  也同样返回 `409`。**成功只递增一次修订号**，并记录一条 `order.commit` 审计
+  （含整单前后完整快照与步骤明细）。
+
 ### 审计
 每次成功变更记录：时间（UTC）、操作者、角色、动作、参数、
 变更前后修订号以及 **变更前后完整网络状态快照**（JSON）。
@@ -146,9 +167,13 @@ cp .env.example .env
    隔离是否满足，可随时结束许可。
 4. **拓扑管理** 页（管理员）：维护节点和有向供电关系。
    规则：电源只能作起点、设备只能作终点、不允许自环和重复接线。
-5. **变更记录** 页：查看所有成功变更的时间、操作者、动作、前后修订号，
+5. **操作单** 页（操作员）：点“＋ 开关步骤”逐行选择动作（分闸/挂牌/解牌/合闸）
+   与目标开关，需要时点“＋ 末步申请许可”选择设备；**预演** 逐步展示模拟结果
+   （不落地），**确认执行** 才原子落库。任一步违规会列出步骤序号、原因与带电
+   路径，整单不会产生任何影响。
+6. **变更记录** 页：查看所有成功变更的时间、操作者、动作、前后修订号，
    可展开查看前后完整状态快照。
-6. 页面每 10 秒轮询一次修订号；他人提交后会自动刷新。若你的提交过期，
+7. 页面每 10 秒轮询一次修订号；他人提交后会自动刷新。若你的提交过期，
    会收到明确提示并刷新到最新状态。
 
 ### 演示网络
@@ -183,11 +208,61 @@ cp .env.example .env
 | POST | `/api/switches/:id/untag` | operator | 解牌（破坏有效许可隔离时拒绝） |
 | POST | `/api/permits` | operator | 申请许可 `{device_id}` |
 | POST | `/api/permits/:id/end` | operator | 结束许可 |
+| POST | `/api/orders/preview` | operator | 预演操作单 `{steps:[...]}`，模拟执行后回滚，不落地 |
+| POST | `/api/orders/commit` | operator | 确认操作单，按序原子执行，修订号只 +1 |
+
+#### 操作单步骤格式
+
+```json
+{
+  "actor": "张三", "role": "operator", "revision": 1,
+  "steps": [
+    { "action": "open",  "switch_id": 3 },
+    { "action": "tag",   "switch_id": 3 },
+    { "action": "open",  "switch_id": 4 },
+    { "action": "tag",   "switch_id": 4 },
+    { "action": "permit", "device_id": 6 }
+  ]
+}
+```
+
+- 开关步 `action` ∈ `open`/`close`/`tag`/`untag`，须带 `switch_id`；
+- 许可步 `action: "permit"` 须带 `device_id`，**只能是最后一步**（至多一个）；
+- `steps` 为 1–50 的非空数组。
+
+预演成功响应（`200`）：`{ ok, preview:true, allOk, revision, steps:[{step,action,ok,...}],
+isolation? }`；某步不可执行时 `allOk:false`，`failedStep` 与失败步条目给出
+`error{code,message}`，隔离类失败附 `livePaths`/`violations`（至少一条真实
+带电路径）。确认成功响应（`200`）：`{ ok, action:"order.commit", steps, permit_id?,
+snapshot, revision }`。确认失败响应（`4xx`）：`{ ok:false,
+error:{code:"ORDER_STEP_FAILED",...}, step, cause:{code,message}, livePaths?,
+violations? }`，整单已回滚。
+
+#### 操作单 curl 示例
+
+```bash
+# 预演(不落地): 依次分闸挂牌 K1/K2, 末步为 1#循环水泵 申请许可
+curl -s -X POST http://localhost:3000/api/orders/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"actor":"张三","role":"operator","revision":1,"steps":[
+        {"action":"open","switch_id":3},{"action":"tag","switch_id":3},
+        {"action":"open","switch_id":4},{"action":"tag","switch_id":4},
+        {"action":"permit","device_id":6}]}'
+
+# 确认(原子执行, 修订号只 +1): 同上请求体, 改打 /api/orders/commit
+curl -s -X POST http://localhost:3000/api/orders/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"actor":"张三","role":"operator","revision":1,"steps":[
+        {"action":"open","switch_id":3},{"action":"tag","switch_id":3},
+        {"action":"open","switch_id":4},{"action":"tag","switch_id":4},
+        {"action":"permit","device_id":6}]}'
+```
 
 错误约定：`400` 参数错误 / `403` 角色不允许 / `404` 不存在 /
 `409 STALE_REVISION` 修订号过期（响应含 `current` 当前状态）/
 `422` 业务规则不满足（如 `PERMIT_NOT_ISOLATED`、`ISOLATION_VIOLATION`、
-`SWITCH_TAGGED`，响应中携带未切断路径）。
+`SWITCH_TAGGED`、`ORDER_STEP_FAILED`，响应中携带未切断路径；
+操作单步骤失败另附 `step` 步骤序号与 `cause` 原始原因）。
 
 拒绝隔离类错误（`PERMIT_NOT_ISOLATED` 及 `ISOLATION_VIOLATION` 的每个
 `violations[]`）响应体额外包含：
@@ -219,6 +294,7 @@ cp .env.example .env
 │   └── styles.css
 └── test/
     ├── smoke.js            # 端到端业务规则冒烟测试(HTTP)
+    ├── order.e2e.js        # 临时操作单回归(预演不落地/原子确认/逐步保护/回滚)
     ├── graph.test.js       # 隔离判定单元测试(枚举触顶/超长/环路)
     └── truncation.e2e.js   # 200 条挂牌支路挤掉带电路径的 HTTP 回归(手动)
 ```
@@ -233,6 +309,10 @@ npm run test:graph
 LOTO_DB=/tmp/loto-test.db PORT=3100 node server.js
 node test/smoke.js
 
+# 操作单回归(需全新演示库; 与冒烟测试分时复用 3100 即可)
+LOTO_DB=/tmp/loto-order-test.db PORT=3100 node server.js
+node test/order.e2e.js
+
 # 枚举触顶回归(同样打到 PORT=3100 的服务; 结束会清理临时拓扑)
 node test/truncation.e2e.js
 ```
@@ -246,6 +326,10 @@ node test/smoke.js                            # 终端2
 
 冒烟测试覆盖：路径枚举与申请失败、挂牌合闸互锁、隔离保护整体拒绝与回滚、
 乐观锁 409、角色控制、拓扑约束、审计快照等共 46 项断言。
+`order.e2e.js` 覆盖：预演不落地（网络/许可/修订号/审计均不变）、各步结果与
+目标设备隔离状态展示、确认原子执行且修订号只 +1、审计整单前后快照、
+“解牌→重新挂牌”补救序列首步即拒、中途失败整单回滚、隔离失败附带电路径、
+STALE_REVISION 返回当前完整状态、角色与参数校验等共 56 项断言。
 `graph.test.js` 覆盖：完整可达性判定、无启用电源 / 全挂牌可申请、
 “前 200 条支路均在挂牌处截断、其后直达设备”的核心回归、超长路径
 （>64 节点）见证路径、含环图、243 条路径数量触顶、违规许可的截断信息，

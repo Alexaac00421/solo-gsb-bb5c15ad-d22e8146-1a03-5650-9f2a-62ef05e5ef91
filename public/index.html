@@ -27,6 +27,7 @@
   <nav class="tabs">
     <button class="tab active" data-tab="network">供电网络</button>
     <button class="tab" data-tab="permits">检修许可</button>
+    <button class="tab" data-tab="order">操作单</button>
     <button class="tab" data-tab="admin">拓扑管理<span class="admin-dot">管理员</span></button>
     <button class="tab" data-tab="audit">变更记录</button>
   </nav>
@@ -65,6 +66,28 @@
           <button id="applyBtn" class="btn btn-primary">申请检修许可</button>
         </div>
         <p class="hint">仅当所有启用电源到目标设备的供电路径都经过已挂牌开关时，许可才生效。申请失败将列出未切断路径。</p>
+      </div>
+    </section>
+
+    <!-- 操作单 -->
+    <section id="tab-order" class="tabpane">
+      <div class="panel">
+        <h3>临时操作单 <span class="hint">操作员按序编排开关动作，末步可申请一个检修许可；预演不落地，确认时原子执行</span></h3>
+        <table class="grid" id="orderTable">
+          <thead><tr><th style="width:44px">#</th><th style="width:130px">动作</th><th>目标</th><th style="width:70px"></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="form-row" style="margin-top:10px">
+          <button id="orderAddSwitch" class="btn btn-sm">＋ 开关步骤</button>
+          <button id="orderAddPermit" class="btn btn-sm">＋ 末步申请许可</button>
+          <button id="orderClear" class="btn btn-sm">清空</button>
+        </div>
+        <div class="form-row" style="margin-top:12px">
+          <button id="orderPreview" class="btn">预演（不落地）</button>
+          <button id="orderCommit" class="btn btn-primary">确认执行</button>
+          <span class="hint">确认时按原顺序逐步执行，任一步违规整单回滚；修订号只递增一次。</span>
+        </div>
+        <div id="orderResult" style="margin-top:12px"></div>
       </div>
     </section>
 

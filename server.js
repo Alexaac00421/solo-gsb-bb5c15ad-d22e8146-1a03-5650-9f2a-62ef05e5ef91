@@ -100,6 +100,80 @@ const insertAudit = db.prepare(
    VALUES (@actor, @role, @action, @detail, @rev_before, @rev_after, @state_before, @state_after)`
 );
 
+// ---------------------------------------------------------------------------
+// 步骤原语 —— 单独端点与临时操作单共用, 保证两处规则完全一致
+// ---------------------------------------------------------------------------
+/**
+ * 开关状态机单步执行: open 分闸 / close 合闸 / tag 挂牌 / untag 解牌。
+ * 只校验并落库当前一步; 有效许可隔离复查由调用方负责(assertActivePermitsIsolated)。
+ */
+function applySwitchAction(graph, id, action) {
+  const node = graph.nodeById.get(id);
+  if (!node || node.kind !== 'switch') throw new ApiError(404, 'NOT_FOUND', '开关不存在');
+  if (action === 'open') {
+    if (node.open_pos) throw new ApiError(422, 'INVALID_STATE', '开关已在分闸(断开)位置');
+    db.prepare(`UPDATE nodes SET open_pos=1 WHERE id=?`).run(id);
+  } else if (action === 'close') {
+    if (node.tagged) throw new ApiError(422, 'SWITCH_TAGGED', '挂牌开关不得合闸, 请先解牌');
+    if (!node.open_pos) throw new ApiError(422, 'INVALID_STATE', '开关已在合闸位置');
+    db.prepare(`UPDATE nodes SET open_pos=0 WHERE id=?`).run(id);
+  } else if (action === 'tag') {
+    if (node.tagged) throw new ApiError(422, 'INVALID_STATE', '该开关已经挂牌');
+    if (!node.open_pos) throw new ApiError(422, 'SWITCH_NOT_OPEN', '挂牌前必须先将开关分闸(断开)');
+    db.prepare(`UPDATE nodes SET tagged=1 WHERE id=?`).run(id);
+  } else if (action === 'untag') {
+    if (!node.tagged) throw new ApiError(422, 'INVALID_STATE', '该开关未挂牌');
+    db.prepare(`UPDATE nodes SET tagged=0 WHERE id=?`).run(id);
+  } else {
+    throw new ApiError(400, 'INVALID_ACTION', `未知开关动作: ${action}`);
+  }
+  return { node_id: id, name: node.name };
+}
+
+/** 申请检修许可: 完整可达性隔离判定通过才生效, 否则 422 并附实际带电路径。 */
+function applyPermitApply(graph, deviceId, actor) {
+  const node = graph.nodeById.get(deviceId);
+  if (!node || node.kind !== 'device') throw new ApiError(404, 'NOT_FOUND', '目标设备不存在');
+  if (activePermits().some((p) => p.device_id === deviceId)) {
+    throw new ApiError(422, 'PERMIT_EXISTS', '该设备已有有效检修许可');
+  }
+  const { isolated, livePaths, truncated } = evaluateIsolation(graph, deviceId);
+  if (!isolated) {
+    throw new ApiError(422, 'PERMIT_NOT_ISOLATED',
+      '许可申请失败: 仍存在未切断的供电路径, 请断开并挂牌相关开关',
+      {
+        device_id: deviceId,
+        device_name: node.name,
+        livePaths: livePaths.map((p) => serializePath(graph, p)),
+        // 至少返回一条真实带电路径; 列表触顶时用 truncated 标记
+        truncated
+      });
+  }
+  const info = db.prepare(
+    `INSERT INTO permits(device_id, status, requested_by) VALUES (?, 'active', ?)`
+  ).run(deviceId, actor);
+  return { permit_id: info.lastInsertRowid, device_id: deviceId, device_name: node.name };
+}
+
+/** 对全部有效许可复查隔离条件; 任一许可将失去隔离则抛 422 ISOLATION_VIOLATION。 */
+function assertActivePermitsIsolated() {
+  const graph = loadGraph();
+  const violations = validateActivePermits(graph, activePermits());
+  if (violations.length > 0) {
+    throw new ApiError(422, 'ISOLATION_VIOLATION',
+      '操作被拒绝: 会使有效检修许可失去断电隔离',
+      {
+        violations: violations.map((v) => ({
+          permit_id: v.permit.id,
+          device_id: v.permit.device_id,
+          device_name: v.permit.device_name,
+          livePaths: v.livePaths.map((p) => serializePath(graph, p)),
+          truncated: v.truncated
+        }))
+      });
+  }
+}
+
 /**
  * 统一的变更处理:
  *  1. 校验操作者/角色/修订号
@@ -146,23 +220,7 @@ function runMutation(res, options) {
 
     mutate({ graph: loadGraph(), detail, result });
 
-    if (!skipPermitCheck) {
-      const afterGraph = loadGraph();
-      const violations = validateActivePermits(afterGraph, activePermits());
-      if (violations.length > 0) {
-        throw new ApiError(422, 'ISOLATION_VIOLATION',
-          '操作被拒绝: 会使有效检修许可失去断电隔离',
-          {
-            violations: violations.map((v) => ({
-              permit_id: v.permit.id,
-              device_id: v.permit.device_id,
-              device_name: v.permit.device_name,
-              livePaths: v.livePaths.map((p) => serializePath(afterGraph, p)),
-              truncated: v.truncated
-            }))
-          });
-      }
-    }
+    if (!skipPermitCheck) assertActivePermitsIsolated();
 
     bumpRevision();
     const revAfter = currentRevision();
@@ -334,20 +392,13 @@ app.delete('/api/admin/edges/:id', wrap((req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
-// 开关操作 —— 仅操作员
+// 开关操作 —— 仅操作员(状态机规则见 applySwitchAction, 与操作单共用)
 // ---------------------------------------------------------------------------
 app.post('/api/switches/:id/open', wrap((req, res) => {
   const id = parseInt(req.params.id, 10);
   runMutation(res, {
     body: req.body, action: 'switch.open', requireRole: 'operator',
-    mutate: ({ graph, detail }) => {
-      const node = graph.nodeById.get(id);
-      if (!node || node.kind !== 'switch') throw new ApiError(404, 'NOT_FOUND', '开关不存在');
-      if (node.open_pos) throw new ApiError(422, 'INVALID_STATE', '开关已在分闸(断开)位置');
-      db.prepare(`UPDATE nodes SET open_pos=1 WHERE id=?`).run(id);
-      detail.node_id = id;
-      detail.name = node.name;
-    }
+    mutate: ({ graph, detail }) => Object.assign(detail, applySwitchAction(graph, id, 'open'))
   });
 }));
 
@@ -355,17 +406,7 @@ app.post('/api/switches/:id/close', wrap((req, res) => {
   const id = parseInt(req.params.id, 10);
   runMutation(res, {
     body: req.body, action: 'switch.close', requireRole: 'operator',
-    mutate: ({ graph, detail }) => {
-      const node = graph.nodeById.get(id);
-      if (!node || node.kind !== 'switch') throw new ApiError(404, 'NOT_FOUND', '开关不存在');
-      if (node.tagged) {
-        throw new ApiError(422, 'SWITCH_TAGGED', '挂牌开关不得合闸, 请先解牌');
-      }
-      if (!node.open_pos) throw new ApiError(422, 'INVALID_STATE', '开关已在合闸位置');
-      db.prepare(`UPDATE nodes SET open_pos=0 WHERE id=?`).run(id);
-      detail.node_id = id;
-      detail.name = node.name;
-    }
+    mutate: ({ graph, detail }) => Object.assign(detail, applySwitchAction(graph, id, 'close'))
   });
 }));
 
@@ -373,17 +414,7 @@ app.post('/api/switches/:id/tag', wrap((req, res) => {
   const id = parseInt(req.params.id, 10);
   runMutation(res, {
     body: req.body, action: 'switch.tag', requireRole: 'operator',
-    mutate: ({ graph, detail }) => {
-      const node = graph.nodeById.get(id);
-      if (!node || node.kind !== 'switch') throw new ApiError(404, 'NOT_FOUND', '开关不存在');
-      if (node.tagged) throw new ApiError(422, 'INVALID_STATE', '该开关已经挂牌');
-      if (!node.open_pos) {
-        throw new ApiError(422, 'SWITCH_NOT_OPEN', '挂牌前必须先将开关分闸(断开)');
-      }
-      db.prepare(`UPDATE nodes SET tagged=1 WHERE id=?`).run(id);
-      detail.node_id = id;
-      detail.name = node.name;
-    }
+    mutate: ({ graph, detail }) => Object.assign(detail, applySwitchAction(graph, id, 'tag'))
   });
 }));
 
@@ -391,14 +422,7 @@ app.post('/api/switches/:id/untag', wrap((req, res) => {
   const id = parseInt(req.params.id, 10);
   runMutation(res, {
     body: req.body, action: 'switch.untag', requireRole: 'operator',
-    mutate: ({ graph, detail }) => {
-      const node = graph.nodeById.get(id);
-      if (!node || node.kind !== 'switch') throw new ApiError(404, 'NOT_FOUND', '开关不存在');
-      if (!node.tagged) throw new ApiError(422, 'INVALID_STATE', '该开关未挂牌');
-      db.prepare(`UPDATE nodes SET tagged=0 WHERE id=?`).run(id);
-      detail.node_id = id;
-      detail.name = node.name;
-    }
+    mutate: ({ graph, detail }) => Object.assign(detail, applySwitchAction(graph, id, 'untag'))
     // 解牌后统一复查有效许可(默认执行), 若重新来电则整次操作拒绝
   });
 }));
@@ -415,29 +439,10 @@ app.post('/api/permits', wrap((req, res) => {
       if (!Number.isInteger(deviceId)) {
         throw new ApiError(400, 'DEVICE_REQUIRED', '必须提供 device_id');
       }
-      const node = graph.nodeById.get(deviceId);
-      if (!node || node.kind !== 'device') throw new ApiError(404, 'NOT_FOUND', '目标设备不存在');
-      if (activePermits().some((p) => p.device_id === deviceId)) {
-        throw new ApiError(422, 'PERMIT_EXISTS', '该设备已有有效检修许可');
-      }
-      const { isolated, livePaths, truncated } = evaluateIsolation(graph, deviceId);
-      if (!isolated) {
-        throw new ApiError(422, 'PERMIT_NOT_ISOLATED',
-          '许可申请失败: 仍存在未切断的供电路径, 请断开并挂牌相关开关',
-          {
-            device_id: deviceId,
-            device_name: node.name,
-            livePaths: livePaths.map((p) => serializePath(graph, p)),
-            // 至少返回一条真实带电路径; 列表触顶时用 truncated 标记
-            truncated
-          });
-      }
-      const info = db.prepare(
-        `INSERT INTO permits(device_id, status, requested_by) VALUES (?, 'active', ?)`
-      ).run(deviceId, req.body.actor.trim());
-      detail.permit_id = info.lastInsertRowid;
-      detail.device_id = deviceId;
-      result.permit_id = info.lastInsertRowid;
+      const r = applyPermitApply(graph, deviceId, req.body.actor.trim());
+      detail.permit_id = r.permit_id;
+      detail.device_id = r.device_id;
+      result.permit_id = r.permit_id;
     }
   });
 }));
@@ -462,9 +467,224 @@ app.post('/api/permits/:id/end', wrap((req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
+// 临时操作单 —— 仅操作员
+// 按序编排开关动作(分闸/挂牌/解牌/合闸), 末步可为设备申请一个许可。
+// 预演(preview): SAVEPOINT 内完整执行后强制回滚, 不改变真实网络、许可、
+//   修订号或审计, 仅展示各步结果与目标设备隔离状态。
+// 确认(commit): 单事务内按原顺序原子执行; 每一步都遵守开关状态机并在
+//   该步后立即复查有效许可隔离保护, 不允许用后续步骤补救前一步违规;
+//   任一步失败整单回滚不落库, 返回步骤序号与原因(隔离失败附实际带电路径);
+//   成功只递增一次修订号, 并记录一条含整单前后快照的审计。
+// ---------------------------------------------------------------------------
+const ORDER_ACTIONS = ['open', 'close', 'tag', 'untag', 'permit'];
+const ORDER_ACTION_LABEL = { open: '分闸', close: '合闸', tag: '挂牌', untag: '解牌', permit: '申请许可' };
+const MAX_ORDER_STEPS = 50;
+
+/** 操作单某一步失败: 携带步骤序号与原始原因(含隔离类错误的带电路径)。 */
+class OrderStepError extends Error {
+  constructor(step, actionLabel, cause) {
+    super(`操作单第 ${step} 步(${actionLabel})失败: ${cause.message}`);
+    this.status = cause.status || 422;
+    this.code = 'ORDER_STEP_FAILED';
+    this.step = step;
+    this.cause = { code: cause.code, message: cause.message };
+    for (const k of ['livePaths', 'violations', 'truncated', 'device_id', 'device_name']) {
+      if (cause[k] !== undefined) this[k] = cause[k];
+    }
+  }
+}
+
+/**
+ * 校验操作单请求(actor/role/revision 与单步写操作同一约定)并规范步骤:
+ *  - steps 为 1..MAX_ORDER_STEPS 的非空数组;
+ *  - 开关步 {action: open/close/tag/untag, switch_id};
+ *  - 许可步 {action: 'permit', device_id} 仅允许出现在末步(至多一个许可)。
+ */
+function parseOrder(body) {
+  const actor = typeof body.actor === 'string' ? body.actor.trim() : '';
+  const role = body.role;
+  const baseRev = Number(body.revision);
+  if (!actor) throw new ApiError(400, 'ACTOR_REQUIRED', '必须填写操作者姓名');
+  if (role !== 'admin' && role !== 'operator') {
+    throw new ApiError(400, 'ROLE_REQUIRED', '角色必须是 admin 或 operator');
+  }
+  if (role !== 'operator') throw new ApiError(403, 'FORBIDDEN', '操作单仅允许 operator 编排执行');
+  if (!Number.isInteger(baseRev) || baseRev < 1) {
+    throw new ApiError(400, 'REVISION_REQUIRED', '必须携带所见修订号 revision(正整数)');
+  }
+  const raw = body.steps;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new ApiError(400, 'STEPS_REQUIRED', '操作单至少包含一个步骤');
+  }
+  if (raw.length > MAX_ORDER_STEPS) {
+    throw new ApiError(400, 'TOO_MANY_STEPS', `操作单最多 ${MAX_ORDER_STEPS} 步`);
+  }
+  const steps = raw.map((s, i) => {
+    const action = s && s.action;
+    if (!ORDER_ACTIONS.includes(action)) {
+      throw new ApiError(400, 'INVALID_ACTION',
+        `第 ${i + 1} 步动作无效, 允许: open/close/tag/untag/permit`);
+    }
+    if (action === 'permit') {
+      if (i !== raw.length - 1) {
+        throw new ApiError(400, 'PERMIT_NOT_LAST', '申请许可只能是操作单的最后一步');
+      }
+      const deviceId = Number(s.device_id);
+      if (!Number.isInteger(deviceId)) {
+        throw new ApiError(400, 'DEVICE_REQUIRED', `第 ${i + 1} 步必须提供设备编号 device_id`);
+      }
+      return { action, device_id: deviceId };
+    }
+    const switchId = Number(s.switch_id);
+    if (!Number.isInteger(switchId)) {
+      throw new ApiError(400, 'SWITCH_REQUIRED', `第 ${i + 1} 步必须提供开关编号 switch_id`);
+    }
+    return { action, switch_id: switchId };
+  });
+  return { actor, role, baseRev, steps };
+}
+
+/**
+ * 在事务内按原顺序执行操作单各步, 已完成的步骤结果追加到 results。
+ * 每个开关步执行后立即复查有效许可隔离(与单独端点一致), 许可步自身做隔离判定;
+ * 任一步失败抛 OrderStepError, 由外层决定回滚(确认)或仅展示(预演)。
+ */
+function executeOrderSteps(steps, actor, results) {
+  steps.forEach((step, i) => {
+    const stepNo = i + 1;
+    try {
+      if (step.action === 'permit') {
+        const r = applyPermitApply(loadGraph(), step.device_id, actor);
+        results.push({
+          step: stepNo, action: 'permit', ok: true,
+          device_id: step.device_id, device_name: r.device_name, permit_id: r.permit_id
+        });
+      } else {
+        const r = applySwitchAction(loadGraph(), step.switch_id, step.action);
+        assertActivePermitsIsolated();
+        results.push({
+          step: stepNo, action: step.action, ok: true,
+          switch_id: step.switch_id, name: r.name
+        });
+      }
+    } catch (e) {
+      if (e instanceof ApiError) throw new OrderStepError(stepNo, ORDER_ACTION_LABEL[step.action], e);
+      throw e;
+    }
+  });
+  return results;
+}
+
+// 预演: 完整执行后强制回滚, 不落库、不递增修订号、不写审计
+app.post('/api/orders/preview', wrap((req, res) => {
+  const { actor, baseRev, steps } = parseOrder(req.body || {});
+  db.prepare(`SAVEPOINT order_preview`).run();
+  try {
+    const rev = currentRevision();
+    if (rev !== baseRev) {
+      throw new ApiError(409, 'STALE_REVISION',
+        `修订号已过期: 你基于 ${baseRev}, 当前为 ${rev}`,
+        { current: buildSnapshot() });
+    }
+    const results = [];
+    let stepError = null;
+    try {
+      executeOrderSteps(steps, actor, results);
+    } catch (e) {
+      if (e instanceof OrderStepError) stepError = e; else throw e;
+    }
+
+    const body = { ok: true, preview: true, allOk: !stepError, revision: rev, steps: results };
+    if (stepError) {
+      // 首个失败步即停止(后续步骤依赖前序状态, 不再预演), 附原因与带电路径
+      const def = steps[stepError.step - 1];
+      const entry = { step: stepError.step, action: def.action, ok: false, error: stepError.cause };
+      if (def.action === 'permit') entry.device_id = def.device_id;
+      else entry.switch_id = def.switch_id;
+      for (const k of ['livePaths', 'violations', 'truncated']) {
+        if (stepError[k] !== undefined) entry[k] = stepError[k];
+      }
+      body.steps.push(entry);
+      body.failedStep = stepError.step;
+    } else if (steps[steps.length - 1].action === 'permit') {
+      // 末步为申请许可: 展示目标设备在临时事务中的隔离状态(许可已临时生效)
+      const deviceId = steps[steps.length - 1].device_id;
+      const graph = loadGraph();
+      const r = evaluateIsolation(graph, deviceId);
+      body.isolation = {
+        device_id: deviceId,
+        device_name: graph.nodeById.get(deviceId).name,
+        isolated: r.isolated,
+        livePaths: r.livePaths.map((p) => serializePath(graph, p)),
+        blockedPaths: r.blockedPaths.map((p) => serializePath(graph, p)),
+        truncated: r.truncated
+      };
+    }
+    res.json(body);
+  } finally {
+    db.prepare(`ROLLBACK TO order_preview`).run();
+    db.prepare(`RELEASE order_preview`).run();
+  }
+}));
+
+// 确认: 单事务原子执行, 成功只递增一次修订号并记录整单前后快照
+app.post('/api/orders/commit', wrap((req, res) => {
+  const { actor, role, baseRev, steps } = parseOrder(req.body || {});
+  const results = [];
+  let payload;
+  const tx = db.transaction(() => {
+    const revBefore = currentRevision();
+    if (revBefore !== baseRev) {
+      throw new ApiError(409, 'STALE_REVISION',
+        `修订号已过期: 你基于 ${baseRev}, 当前为 ${revBefore}`,
+        { current: buildSnapshot() });
+    }
+    const stateBefore = buildSnapshot();
+
+    executeOrderSteps(steps, actor, results);
+
+    bumpRevision();
+    const revAfter = currentRevision();
+    const stateAfter = buildSnapshot();
+    insertAudit.run({
+      actor, role, action: 'order.commit',
+      detail: JSON.stringify({ steps: results }),
+      rev_before: revBefore,
+      rev_after: revAfter,
+      state_before: JSON.stringify(stateBefore),
+      state_after: JSON.stringify(stateAfter)
+    });
+    const permitStep = results.find((r) => r.action === 'permit');
+    payload = {
+      ok: true, action: 'order.commit', steps: results,
+      ...(permitStep ? { permit_id: permitStep.permit_id } : {}),
+      snapshot: stateAfter, revision: revAfter
+    };
+  });
+  tx.immediate();
+  res.status(200).json(payload);
+}));
+
+// ---------------------------------------------------------------------------
 // 错误处理
 // ---------------------------------------------------------------------------
 app.use((err, req, res, next) => {
+  if (err instanceof OrderStepError) {
+    const body = {
+      ok: false,
+      error: { code: err.code, message: err.message },
+      step: err.step,
+      cause: err.cause
+    };
+    if (err.livePaths) body.livePaths = err.livePaths;
+    if (err.violations) body.violations = err.violations;
+    if (err.truncated) body.truncated = err.truncated;
+    if (err.device_id !== undefined) {
+      body.device_id = err.device_id;
+      body.device_name = err.device_name;
+    }
+    return res.status(err.status).json(body);
+  }
   if (err instanceof ApiError) {
     const body = { ok: false, error: { code: err.code, message: err.message } };
     if (err.current) body.current = err.current;
