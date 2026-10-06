@@ -1,0 +1,16 @@
+{
+  "name": "loto-drill",
+  "version": "1.0.0",
+  "description": "厂内检修断电挂牌演练系统 (Lockout/Tagout drill web app)",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "init-db": "node src/init-db.js",
+    "start": "node server.js",
+    "test:graph": "node test/graph.test.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "express": "^4.21.2"
+  }
+}

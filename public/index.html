@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>厂内检修断电挂牌演练系统</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">⚡ 断电挂牌演练 <span class="brand-sub">Lockout / Tagout Drill</span></div>
+    <div class="identity">
+      <label>操作者
+        <input type="text" id="actor" maxlength="20" placeholder="姓名">
+      </label>
+      <label>身份
+        <select id="role">
+          <option value="operator">操作员</option>
+          <option value="admin">管理员</option>
+        </select>
+      </label>
+      <div class="rev-info">修订号 <b id="revision">-</b></div>
+      <button id="refreshBtn" class="btn">刷新</button>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="network">供电网络</button>
+    <button class="tab" data-tab="permits">检修许可</button>
+    <button class="tab" data-tab="admin">拓扑管理<span class="admin-dot">管理员</span></button>
+    <button class="tab" data-tab="audit">变更记录</button>
+  </nav>
+
+  <main>
+    <!-- 供电网络 -->
+    <section id="tab-network" class="tabpane active">
+      <div class="layout">
+        <div class="panel canvas-panel">
+          <div class="legend">
+            <span><i class="dot source"></i>电源</span>
+            <span><i class="dot switch"></i>开关</span>
+            <span><i class="dot device"></i>设备</span>
+            <span><i class="line tagged-line"></i>挂牌点切断</span>
+            <span><i class="line live-line"></i>未切断路径</span>
+          </div>
+          <div id="graphCanvas"></div>
+        </div>
+        <aside class="panel side-panel">
+          <h3>节点操作</h3>
+          <div id="nodeDetail" class="node-detail">点击图中的电源 / 开关 / 设备查看可执行操作。</div>
+          <h3>许可隔离状态</h3>
+          <div id="isolationList" class="isolation-list"></div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- 检修许可 -->
+    <section id="tab-permits" class="tabpane">
+      <div class="panel">
+        <h3>有效检修许可</h3>
+        <div id="permitList"></div>
+        <h3 style="margin-top:18px">申请新许可</h3>
+        <div class="form-row">
+          <select id="applyDevice"></select>
+          <button id="applyBtn" class="btn btn-primary">申请检修许可</button>
+        </div>
+        <p class="hint">仅当所有启用电源到目标设备的供电路径都经过已挂牌开关时，许可才生效。申请失败将列出未切断路径。</p>
+      </div>
+    </section>
+
+    <!-- 拓扑管理 -->
+    <section id="tab-admin" class="tabpane">
+      <div class="layout two-col">
+        <div class="panel">
+          <h3>新增节点</h3>
+          <div class="form-row">
+            <select id="newNodeKind">
+              <option value="source">电源</option>
+              <option value="switch">开关</option>
+              <option value="device">设备</option>
+            </select>
+            <input type="text" id="newNodeName" placeholder="名称，如 3#进线开关" maxlength="30">
+            <button id="addNodeBtn" class="btn btn-primary">新增</button>
+          </div>
+          <h3 style="margin-top:18px">节点列表</h3>
+          <table class="grid" id="nodeGrid">
+            <thead><tr><th>ID</th><th>类型</th><th>名称</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="panel">
+          <h3>供电关系（有向边：起点 → 终点）</h3>
+          <div class="form-row">
+            <select id="edgeFrom"></select><span>→</span><select id="edgeTo"></select>
+            <button id="addEdgeBtn" class="btn btn-primary">接线</button>
+          </div>
+          <p class="hint">电源只能做起点、设备只能做终点；不允许自环或重复接线。</p>
+          <table class="grid" id="edgeGrid">
+            <thead><tr><th>ID</th><th>起点</th><th></th><th>终点</th><th>操作</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 变更记录 -->
+    <section id="tab-audit" class="tabpane">
+      <div class="panel">
+        <h3>变更记录（成功变更留存时间、操作者与前后状态）</h3>
+        <div id="auditList" class="audit-list"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>
